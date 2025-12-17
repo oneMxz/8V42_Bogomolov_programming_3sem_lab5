@@ -7,7 +7,6 @@ on:
     branches: [main, master]
 
 jobs:
-  # 1. Подготовка версии (работает всегда)
   prepare-version:
     runs-on: ubuntu-latest
     outputs:
@@ -46,12 +45,11 @@ jobs:
             echo "new_tag=$NEW_TAG" >> $GITHUB_OUTPUT
             echo "Release version: $NEW_TAG"
           else
-            NEW_TAG="dev-${ GITHUB_SHA:0:8 }"
+            NEW_TAG="dev-${GITHUB_SHA:0:8}"
             echo "new_tag=$NEW_TAG" >> $GITHUB_OUTPUT
             echo "Development version: $NEW_TAG"
           fi
 
-  # 2. Сборка Linux
   build-linux:
     needs: prepare-version
     runs-on: ubuntu-latest
@@ -127,7 +125,6 @@ jobs:
           path: physics-linux-*.tar.gz
           retention-days: 7
 
-  # 3. Сборка Windows
   build-windows:
     needs: prepare-version
     runs-on: windows-latest
@@ -207,7 +204,6 @@ jobs:
           path: physics-windows-*.zip
           retention-days: 7
 
-  # 4. Создание релиза (ТОЛЬКО ПОСЛЕ успешной сборки)
   create-release:
     if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
     needs: [prepare-version, build-linux, build-windows]
@@ -247,7 +243,7 @@ jobs:
           draft: false
           prerelease: false
           files: |
-            ./artifacts/**/*.tar.gz
-            ./artifacts/**/*.zip
+            ./artifacts/physics-linux/*.tar.gz
+            ./artifacts/physics-windows/*.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
