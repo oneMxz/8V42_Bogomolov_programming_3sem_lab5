@@ -125,6 +125,7 @@ jobs:
           path: physics-linux-*.tar.gz
           retention-days: 7
 
+   # 3. Сборка Windows
   build-windows:
     needs: prepare-version
     runs-on: windows-latest
@@ -140,63 +141,117 @@ jobs:
       - name: Install SFML
         shell: pwsh
         run: |
+          # Скачиваем SFML для Windows
           $SFML_URL = "https://github.com/SFML/SFML/releases/download/2.6.0/SFML-2.6.0-windows-vc17-64-bit.zip"
           Invoke-WebRequest -Uri $SFML_URL -OutFile "sfml.zip"
           Expand-Archive -Path "sfml.zip" -DestinationPath "C:/SFML"
-          echo "SFML_DIR=C:/SFML/lib/cmake/SFML" >> $env:GITHUB_ENV
+          # Устанавливаем переменную окружения для CMake
+          Write-Output "SFML_DIR=C:/SFML/lib/cmake/SFML" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Configure CMake
         shell: pwsh
         run: |
-          echo "Building version: ${{ needs.prepare-version.outputs.new_tag }}"
-          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DVERSION="${{ needs.prepare-version.outputs.new_tag }}" -DSFML_DIR="$env:SFML_DIR"
+          Write-Output "Building version: ${{ needs.prepare-version.outputs.new_tag }}"
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release `
+            -DVERSION="${{ needs.prepare-version.outputs.new_tag }}" `
+            -DSFML_DIR="$env:SFML_DIR"
 
       - name: Build project
-        run: cmake --build build
+        run: cmake --build build --config Release
 
       - name: Find executable
         shell: pwsh
         run: |
-          $exe = Get-ChildItem -Path build -Recurse -Include *.exe | Select-Object -First 1
+          # Ищем исполняемый файл в папке build
+          $exe = Get-ChildItem -Path "build" -Recurse -Include "*.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          
           if ($exe) {
-            echo "EXE_PATH=$($exe.FullName)" >> $env:GITHUB_ENV
-            echo "✅ Found executable: $($exe.FullName)"
+            # Сохраняем путь к исполняемому файлу
+            $exePath = $exe.FullName
+            Write-Output "EXE_PATH=$exePath" | Out-File -FilePath $env:GITHUB_ENV -Append
+            Write-Output "✅ Found executable: $exePath"
           } else {
-            echo "❌ No executable found!"
-            exit 1}
-        
-          fi
+            Write-Output "❌ No executable found!"
+            # Показываем, что есть в папке build
+            Get-ChildItem -Path "build" -Recurse -File | Format-Table Name, FullName
+            exit 1
+          }
 
       - name: Verify data
         shell: pwsh
         run: |
           if (Test-Path "data") {
-            Write-Host "✅ Data directory found"
+            Write-Output "✅ Data directory found"
+            # Показываем содержимое папки data
+            Get-ChildItem -Path "data"
           } else {
-            Write-Host "❌ Data directory not found!"
+            Write-Output "❌ Data directory not found!"
             exit 1
           fi
 
       - name: Quick test
         shell: pwsh
         run: |
-          $process = Start-Process -FilePath "$env:EXE_PATH" -ArgumentList "data\smile.txt" -NoNewWindow -PassThru
-          Start-Sleep -Seconds 2
-          if (!$process.HasExited) {
-            Stop-Process -Id $process.Id -Force
+          if (![string]::IsNullOrEmpty($env:EXE_PATH) -and (Test-Path $env:EXE_PATH)) {
+            Write-Output "Testing $env:EXE_PATH with data\smile.txt..."
+            
+            # Запускаем процесс
+            $process = Start-Process -FilePath "$env:EXE_PATH" `
+              -ArgumentList "data\smile.txt" `
+              -NoNewWindow `
+              -PassThru
+            
+            # Даем программе запуститься
+            Start-Sleep -Seconds 2
+            
+            # Завершаем процесс если он еще работает
+            if (!$process.HasExited) {
+              Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+            }
+            
+            Write-Output "Test completed"
+          } else {
+            Write-Output "⚠️ Executable not found, skipping test"
           }
-          Write-Host "Test completed"
 
       - name: Package Windows
         shell: pwsh
         run: |
           $VERSION = "${{ needs.prepare-version.outputs.new_tag }}"
           $FOLDER = "physics-windows-$VERSION"
-          mkdir $FOLDER
-          Copy-Item "$env:EXE_PATH" $FOLDER/
-          Copy-Item "C:/SFML/bin/*.dll" $FOLDER/
-          Copy-Item -Recurse "data" $FOLDER/ -ErrorAction SilentlyContinue
-          Compress-Archive -Path "$FOLDER/*" -DestinationPath "physics-windows-$VERSION.zip"
+          
+          # Создаем папку для релиза
+          New-Item -ItemType Directory -Path $FOLDER -Force
+          
+          # Копируем исполняемый файл
+          if (![string]::IsNullOrEmpty($env:EXE_PATH) -and (Test-Path $env:EXE_PATH)) {
+            Copy-Item -Path "$env:EXE_PATH" -Destination "$FOLDER\" -Force
+            Write-Output "✅ Copied executable to $FOLDER"
+          } else {
+            Write-Output "❌ Executable not found at $env:EXE_PATH"
+            exit 1
+          }
+          
+          # Копируем DLL из SFML
+          if (Test-Path "C:/SFML/bin") {
+            Copy-Item -Path "C:/SFML/bin/*.dll" -Destination "$FOLDER\" -Force -ErrorAction SilentlyContinue
+            Write-Output "✅ Copied SFML DLLs"
+          }
+          
+          # Копируем данные
+          if (Test-Path "data") {
+            Copy-Item -Path "data" -Destination "$FOLDER\" -Recurse -Force -ErrorAction SilentlyContinue
+            Write-Output "✅ Copied data directory"
+          }
+          
+          # Создаем ZIP архив
+          $zipFile = "physics-windows-$VERSION.zip"
+          Compress-Archive -Path "$FOLDER\*" -DestinationPath $zipFile -CompressionLevel Optimal
+          
+          Write-Output "✅ Created package: $zipFile"
+          
+          # Сохраняем имя архива для следующего шага
+          Write-Output "ZIP_FILE=$zipFile" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v4
