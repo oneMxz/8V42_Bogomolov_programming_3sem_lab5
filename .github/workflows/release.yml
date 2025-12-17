@@ -7,8 +7,8 @@ on:
     branches: [main, master]
 
 jobs:
-  # 1. Создание релиза и определение версии (работает всегда, но релиз только для main/master)
-  create-release:
+  # 1. Подготовка версии (работает всегда)
+  prepare-version:
     runs-on: ubuntu-latest
     outputs:
       new_tag: ${{ steps.bump_version.outputs.new_tag }}
@@ -39,7 +39,6 @@ jobs:
         id: bump_version
         run: |
           if [ "${{ steps.check_branch.outputs.is_release }}" = "true" ]; then
-            # Для main/master - увеличиваем патч
             VERSION=${LAST_TAG#v}
             IFS='.' read -r MAJOR MINOR PATCH <<< "$VERSION"
             NEW_PATCH=$((PATCH + 1))
@@ -47,26 +46,14 @@ jobs:
             echo "new_tag=$NEW_TAG" >> $GITHUB_OUTPUT
             echo "Release version: $NEW_TAG"
           else
-            # Для PR - dev версия
             NEW_TAG="dev-${{ github.sha:0:8 }}"
             echo "new_tag=$NEW_TAG" >> $GITHUB_OUTPUT
             echo "Development version: $NEW_TAG"
           fi
 
-      - name: Create Release (только для main/master)
-        if: steps.check_branch.outputs.is_release == 'true'
-        uses: softprops/action-gh-release@v1
-        with:
-          tag_name: ${{ steps.bump_version.outputs.new_tag }}
-          name: Release ${{ steps.bump_version.outputs.new_tag }}
-          generate_release_notes: true
-          draft: false
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-  # 2. Сборка Linux (зависит от create-release)
+  # 2. Сборка Linux
   build-linux:
-    needs: create-release
+    needs: prepare-version
     runs-on: ubuntu-latest
     
     steps:
@@ -94,10 +81,10 @@ jobs:
             cmake \
             xvfb
 
-      - name: Configure with Ninja
+      - name: Configure CMake
         run: |
-          echo "Building version: ${{ needs.create-release.outputs.new_tag }}"
-          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DVERSION="${{ needs.create-release.outputs.new_tag }}"
+          echo "Building version: ${{ needs.prepare-version.outputs.new_tag }}"
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DVERSION="${{ needs.prepare-version.outputs.new_tag }}"
 
       - name: Build project
         run: cmake --build build
@@ -106,7 +93,6 @@ jobs:
         run: |
           if [ -f "build/physics" ]; then
             echo "✅ Linux build successful"
-            file build/physics
           else
             echo "❌ Linux executable not found"
             exit 1
@@ -115,8 +101,7 @@ jobs:
       - name: Verify data
         run: |
           if [ -d "data" ]; then
-            echo "Data files:"
-            ls -la data/
+            echo "✅ Data directory exists"
           else
             echo "❌ Data directory not found!"
             exit 1
@@ -127,34 +112,24 @@ jobs:
           timeout --preserve-status 3 xvfb-run -a ./build/physics data/smile.txt || true
           echo "Test completed"
 
-      - name: Package (Linux)
+      - name: Package Linux
         run: |
-          VERSION="${{ needs.create-release.outputs.new_tag }}"
+          VERSION="${{ needs.prepare-version.outputs.new_tag }}"
           mkdir -p physics-linux-$VERSION
           cp build/physics physics-linux-$VERSION/
-          cp -r data/ physics-linux-$VERSION/ 2>/dev/null || true
+          [ -d "data" ] && cp -r data/ physics-linux-$VERSION/
           tar -czf physics-linux-$VERSION.tar.gz physics-linux-$VERSION/
 
-      - name: Upload Linux package to release
-        if: needs.create-release.outputs.is_release == 'true'
-        uses: softprops/action-gh-release@v1
-        with:
-          tag_name: ${{ needs.create-release.outputs.new_tag }}
-          files: physics-linux-*.tar.gz
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Upload Linux artifact (для PR)
-        if: needs.create-release.outputs.is_release == 'false'
+      - name: Upload Linux artifact
         uses: actions/upload-artifact@v4
         with:
           name: physics-linux
           path: physics-linux-*.tar.gz
-          retention-days: 1
+          retention-days: 7
 
-  # 3. Сборка Windows (зависит от create-release)
+  # 3. Сборка Windows
   build-windows:
-    needs: create-release
+    needs: prepare-version
     runs-on: windows-latest
     
     steps:
@@ -162,23 +137,22 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Setup Ninja
+      - name: Setup build tools
         uses: seanmiddleditch/gha-setup-ninja@master
 
       - name: Install SFML
         shell: pwsh
         run: |
-          # Скачиваем SFML для Windows
           $SFML_URL = "https://github.com/SFML/SFML/releases/download/2.6.0/SFML-2.6.0-windows-vc17-64-bit.zip"
           Invoke-WebRequest -Uri $SFML_URL -OutFile "sfml.zip"
           Expand-Archive -Path "sfml.zip" -DestinationPath "C:/SFML"
           echo "SFML_DIR=C:/SFML/lib/cmake/SFML" >> $env:GITHUB_ENV
 
-      - name: Configure with Ninja
+      - name: Configure CMake
         shell: pwsh
         run: |
-          echo "Building version: ${{ needs.create-release.outputs.new_tag }}"
-          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DVERSION="${{ needs.create-release.outputs.new_tag }}" -DSFML_DIR="$env:SFML_DIR"
+          echo "Building version: ${{ needs.prepare-version.outputs.new_tag }}"
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DVERSION="${{ needs.prepare-version.outputs.new_tag }}" -DSFML_DIR="$env:SFML_DIR"
 
       - name: Build project
         run: cmake --build build
@@ -195,7 +169,7 @@ jobs:
             exit 1
           fi
 
-      - name: Verify data files
+      - name: Verify data
         shell: pwsh
         run: |
           if (Test-Path "data") {
@@ -211,38 +185,69 @@ jobs:
           $process = Start-Process -FilePath "$env:EXE_PATH" -ArgumentList "data\smile.txt" -NoNewWindow -PassThru
           Start-Sleep -Seconds 2
           if (!$process.HasExited) {
-            $process.CloseMainWindow() | Out-Null
-            Start-Sleep -Seconds 1
-            if (!$process.HasExited) {
-              Stop-Process -Id $process.Id -Force
-            }
+            Stop-Process -Id $process.Id -Force
           }
           Write-Host "Test completed"
 
-      - name: Package (Windows)
+      - name: Package Windows
         shell: pwsh
         run: |
-          $VERSION = "${{ needs.create-release.outputs.new_tag }}"
+          $VERSION = "${{ needs.prepare-version.outputs.new_tag }}"
           $FOLDER = "physics-windows-$VERSION"
           mkdir $FOLDER
           Copy-Item "$env:EXE_PATH" $FOLDER/
           Copy-Item "C:/SFML/bin/*.dll" $FOLDER/
-          Copy-Item -Recurse "data" $FOLDER/ 2>$null
+          Copy-Item -Recurse "data" $FOLDER/ -ErrorAction SilentlyContinue
           Compress-Archive -Path "$FOLDER/*" -DestinationPath "physics-windows-$VERSION.zip"
 
-      - name: Upload Windows package to release
-        if: needs.create-release.outputs.is_release == 'true'
-        uses: softprops/action-gh-release@v1
-        with:
-          tag_name: ${{ needs.create-release.outputs.new_tag }}
-          files: physics-windows-*.zip
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Upload Windows artifact (для PR)
-        if: needs.create-release.outputs.is_release == 'false'
+      - name: Upload Windows artifact
         uses: actions/upload-artifact@v4
         with:
           name: physics-windows
           path: physics-windows-*.zip
-          retention-days: 1
+          retention-days: 7
+
+  # 4. Создание релиза (ТОЛЬКО ПОСЛЕ успешной сборки)
+  create-release:
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    needs: [prepare-version, build-linux, build-windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./artifacts
+
+      - name: List downloaded files
+        run: |
+          find ./artifacts -type f -name "*.tar.gz" -o -name "*.zip"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ needs.prepare-version.outputs.new_tag }}
+          name: Release ${{ needs.prepare-version.outputs.new_tag }}
+          body: |
+            # Physics Simulator ${{ needs.prepare-version.outputs.new_tag }}
+            
+            **Build Information:**
+            - Commit: [${{ github.sha }}](https://github.com/${{ github.repository }}/commit/${{ github.sha }})
+            - Branch: ${{ github.ref_name }}
+            - Build date: $(date -u +'%Y-%m-%d %H:%M:%S UTC')
+            
+            **What's new:**
+            ${{ github.event.head_commit.message }}
+            
+            **Downloads:**
+            - `physics-linux-*.tar.gz` - Linux 64-bit
+            - `physics-windows-*.zip` - Windows 64-bit (includes all DLLs)
+          draft: false
+          prerelease: false
+          files: |
+            ./artifacts/**/*.tar.gz
+            ./artifacts/**/*.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
