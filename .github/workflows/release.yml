@@ -46,7 +46,7 @@ jobs:
             echo "new_tag=$NEW_TAG" >> $GITHUB_OUTPUT
             echo "Release version: $NEW_TAG"
           else
-            NEW_TAG="dev-${{ github.sha:0:8 }}"
+            NEW_TAG="dev-${ GITHUB_SHA:0:8 }"
             echo "new_tag=$NEW_TAG" >> $GITHUB_OUTPUT
             echo "Development version: $NEW_TAG"
           fi
