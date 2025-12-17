@@ -7,200 +7,137 @@ on:
     branches: [main, master]
 
 jobs:
-  build-linux:
+  # Job для подготовки версии (только для push в main/master)
+  prepare-version:
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
     runs-on: ubuntu-latest
+    outputs:
+      new_tag: ${{ steps.bump_version.outputs.new_tag }}
+      release_name: ${{ steps.generate_name.outputs.release_name }}
     
     steps:
       - uses: actions/checkout@v4
         with:
-          submodules: recursive
-
-      - name: Install SFML dependencies (Ubuntu)
+          fetch-depth: 0
+          
+      - name: Get latest tag
+        id: get_tag
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libxrandr-dev \
-            libxcursor-dev \
-            libudev-dev \
-            libopenal-dev \
-            libflac-dev \
-            libvorbis-dev \
-            libgl1-mesa-dev \
-            libfreetype6-dev \
-            ninja-build \
-            cmake \
-            xvfb
-
-      - name: Configure CMake with Ninja
+          git fetch --tags --force
+          LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+          echo "last_tag=$LAST_TAG" >> $GITHUB_OUTPUT
+          echo "LAST_TAG=$LAST_TAG" >> $GITHUB_ENV
+          
+      - name: Bump patch version
+        id: bump_version
         run: |
-          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-
-      - name: Build project
+          # Убираем 'v' из тега
+          VERSION=${LAST_TAG#v}
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$VERSION"
+          
+          # Увеличиваем патч
+          NEW_PATCH=$((PATCH + 1))
+          NEW_TAG="v${MAJOR}.${MINOR}.${NEW_PATCH}"
+          
+          echo "new_tag=$NEW_TAG" >> $GITHUB_OUTPUT
+          echo "NEW_TAG=$NEW_TAG" >> $GITHUB_ENV
+          
+      - name: Generate release name
+        id: generate_name
         run: |
-          cmake --build build --config Release
+          SHORT_SHA=${GITHUB_SHA::7}
+          DATE=$(date +'%Y.%m.%d')
+          RELEASE_NAME="Release ${NEW_TAG} (${DATE} - ${SHORT_SHA})"
+          echo "release_name=$RELEASE_NAME" >> $GITHUB_OUTPUT
 
-      - name: Test executable exists
+  # Параллельные сборки (запускаются всегда)
+  build-linux:
+    runs-on: ubuntu-latest
+    needs: [prepare-version]
+    
+    steps:
+      - uses: actions/checkout@v4
+        
+      - name: Build with version
         run: |
-          if [ -f "build/physics" ]; then
-            echo "✅ Executable built successfully"
-            ls -lh build/physics
-          else
-            echo "❌ Executable not found!"
-            find build/ -type f -name "*" | head -20
-            exit 1
-          fi
-
-      - name: Check data files
+          VERSION="${{ needs.prepare-version.outputs.new_tag || 'dev-build' }}"
+          echo "Building version: $VERSION"
+          cmake -B build -G Ninja -DVERSION="$VERSION"
+          cmake --build build
+          
+      - name: Create Linux package
         run: |
-          if [ -d "data" ]; then
-            echo "Data directory exists"
-            ls -la data/
-            echo "First few lines of smile.txt:"
-            head -5 data/smile.txt
-            echo "First few lines of elephant.txt:"
-            head -5 data/elephant.txt
-          else
-            echo "❌ Data directory not found!"
-            exit 1
-          fi
-
-      - name: Run headless test with xvfb
-        run: |
-          echo "Testing physics simulator with smile.txt..."
-          # Запускаем на 2 секунды и завершаем
-          timeout 2 xvfb-run -a ./build/physics data/smile.txt &
-          sleep 1
-          echo "Test completed"
+          VERSION="${{ needs.prepare-version.outputs.new_tag || 'dev' }}"
+          mkdir -p physics-linux-${VERSION#v}
+          cp build/physics physics-linux-${VERSION#v}/
+          tar -czf physics-linux-${VERSION#v}.tar.gz physics-linux-${VERSION#v}/
+          
+      - name: Upload Linux artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: physics-linux
+          path: physics-linux-*.tar.gz
 
   build-windows:
     runs-on: windows-latest
+    needs: [prepare-version]
     
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-
-      - name: Install CMake and Ninja
-        uses: seanmiddleditch/gha-setup-ninja@master
-
-      - name: Configure CMake with Ninja
+        
+      - name: Build with version
         run: |
-          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-
-      - name: Build project
-        run: |
-          cmake --build build --config Release
-
-      - name: Test executable exists
-        run: |
-          if (Test-Path "build\Release\physics.exe") {
-            echo "✅ Executable built successfully (Release)"
-            Get-Item "build\Release\physics.exe"
-            $exePath = "build\Release\physics.exe"
-          } elseif (Test-Path "build\physics.exe") {
-            echo "✅ Executable built successfully (alternative)"
-            Get-Item "build\physics.exe"
-            $exePath = "build\physics.exe"
-          } else {
-            echo "❌ Executable not found!"
-            Get-ChildItem -Path build -Recurse -Include *.exe
-            exit 1
-          }
+          $VERSION = "${{ needs.prepare-version.outputs.new_tag || 'dev-build' }}"
+          echo "Building version: $VERSION"
+          cmake -B build -G Ninja -DVERSION="$VERSION"
+          cmake --build build
           
-          # Сохраняем путь для следующих шагов
-          echo "EXE_PATH=$exePath" | Out-File -FilePath $env:GITHUB_ENV -Append
-
-      - name: Check data files
+      - name: Create Windows package
         run: |
-          if (Test-Path "data") {
-            echo "Data directory exists"
-            Get-ChildItem -Path data
-            echo "First few lines of smile.txt:"
-            Get-Content data\smile.txt -Head 5
-            echo "First few lines of elephant.txt:"
-            Get-Content data\elephant.txt -Head 5
-          } else {
-            echo "❌ Data directory not found!"
-            exit 1
-          fi
-
-      - name: Run test (non-interactive)
-        run: |
-          echo "Testing physics simulator (will run for 2 seconds)..."
-          # Запускаем процесс
-          $process = Start-Process -FilePath "$env:EXE_PATH" -ArgumentList "data\smile.txt" -NoNewWindow -PassThru
-          # Ждем 1 секунду и завершаем процесс
-          Start-Sleep -Seconds 1
-          Stop-Process -Id $process.Id -Force
-          echo "Test completed"
-
-      - name: Create Windows package (ZIP)
-        if: success()
-        run: |
-          # Создаем папку с релизом
-          $releaseDir = "physics-windows-$env:GITHUB_RUN_NUMBER"
-          New-Item -ItemType Directory -Path $releaseDir -Force
+          $VERSION = "${{ needs.prepare-version.outputs.new_tag || 'dev' }}"
+          $FOLDER = "physics-windows-${VERSION#v}"
+          mkdir $FOLDER
+          Copy-Item build/physics.exe $FOLDER/
+          Compress-Archive -Path $FOLDER/* -DestinationPath physics-windows-${VERSION#v}.zip
           
-          # Копируем исполняемый файл
-          Copy-Item "$env:EXE_PATH" -Destination "$releaseDir\physics.exe"
-          
-          # Копируем данные
-          if (Test-Path "data") {
-            Copy-Item -Recurse "data" -Destination $releaseDir
-          }
-          
-          # Копируем README если есть
-          if (Test-Path "README.md") {
-            Copy-Item "README.md" -Destination $releaseDir
-          }
-          
-          # Создаем ZIP архив
-          Compress-Archive -Path "$releaseDir\*" -DestinationPath "physics-windows.zip"
-
       - name: Upload Windows artifact
-        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: physics-windows
-          path: physics-windows.zip
-          retention-days: 7
+          path: physics-windows-*.zip
 
+  # Создание релиза только после успешных сборок
   create-release:
     if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
-    needs: [build-linux, build-windows]
+    needs: [prepare-version, build-linux, build-windows]
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    
+      
     steps:
-      - name: Download Windows artifact
+      - name: Download all artifacts
         uses: actions/download-artifact@v4
-        with:
-          name: physics-windows
-          
+        
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v1
         with:
-          tag_name: ci-build-${{ github.run_number }}
-          name: CI Build ${{ github.run_number }}
+          tag_name: ${{ needs.prepare-version.outputs.new_tag }}
+          name: ${{ needs.prepare-version.outputs.release_name }}
           body: |
-            Automated build of Physics Simulator
+            # Physics Simulator ${{ needs.prepare-version.outputs.new_tag }}
             
-            **Build Information:**
-            - Commit: [${{ github.sha }}](${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }})
-            - Branch: ${{ github.ref_name }}
-            - Workflow: [${{ github.workflow }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+            **Build Details:**
+            - Commit: [${{ github.sha }}](https://github.com/${{ github.repository }}/commit/${{ github.sha }})
+            - Date: ${{ github.event.head_commit.timestamp }}
             
-            **Build Status:**
-            - ✅ Linux: Success
-            - ✅ Windows: Success
-            - 📅 Build date: ${{ github.event.head_commit.timestamp }}
+            **Artifacts:**
+            - `physics-linux-*.tar.gz` - Linux executable
+            - `physics-windows-*.zip` - Windows executable
             
-            **Download:**
-            - [physics-windows.zip](physics-windows.zip) (Windows executable + data)
-            
-            This is an automated build from CI/CD pipeline.
+            **Changelog:**
+            ${{ github.event.head_commit.message }}
           draft: false
           prerelease: false
           files: |
-            physics-windows.zip
+            physics-linux-*.tar.gz
+            physics-windows-*.zip
