@@ -182,12 +182,11 @@ jobs:
         run: |
           if (Test-Path "data") {
             Write-Output "✅ Data directory found"
-            # Показываем содержимое папки data
             Get-ChildItem -Path "data"
           } else {
             Write-Output "❌ Data directory not found!"
             exit 1
-          fi
+          }
 
       - name: Quick test
         shell: pwsh
