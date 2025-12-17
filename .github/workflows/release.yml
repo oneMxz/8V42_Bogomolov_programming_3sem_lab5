@@ -7,6 +7,7 @@ on:
     branches: [main, master]
 
 jobs:
+  # 1. Подготовка версии
   prepare-version:
     runs-on: ubuntu-latest
     outputs:
@@ -32,24 +33,44 @@ jobs:
         run: |
           git fetch --tags --force
           LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
-          echo "last_tag=$LAST_TAG" >> $GITHUB_ENV
+          echo "LAST_TAG=$LAST_TAG" >> $GITHUB_ENV
+          echo "Debug: Found last tag: $LAST_TAG"
 
       - name: Bump version or set dev
         id: bump_version
         run: |
+          echo "Debug: is_release = ${{ steps.check_branch.outputs.is_release }}"
+          
           if [ "${{ steps.check_branch.outputs.is_release }}" = "true" ]; then
+            # Для релиза: увеличиваем патч-версию
             VERSION=${LAST_TAG#v}
+            
+            # Проверяем формат версии
+            if [[ ! $VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "Warning: Invalid version format '$VERSION', using 0.0.0"
+              VERSION="0.0.0"
+            fi
+            
             IFS='.' read -r MAJOR MINOR PATCH <<< "$VERSION"
             NEW_PATCH=$((PATCH + 1))
             NEW_TAG="v${MAJOR}.${MINOR}.${NEW_PATCH}"
-            echo "new_tag=$NEW_TAG" >> $GITHUB_OUTPUT
             echo "Release version: $NEW_TAG"
           else
+            # Для PR: dev версия
             NEW_TAG="dev-${GITHUB_SHA:0:8}"
-            echo "new_tag=$NEW_TAG" >> $GITHUB_OUTPUT
             echo "Development version: $NEW_TAG"
           fi
+          
+          # Проверяем, что тег не пустой
+          if [ -z "$NEW_TAG" ]; then
+            echo "ERROR: Tag is empty! Using fallback"
+            NEW_TAG="v0.0.${{ github.run_number }}"
+          fi
+          
+          echo "new_tag=$NEW_TAG" >> $GITHUB_OUTPUT
+          echo "Final tag to use: $NEW_TAG"
 
+  # 2. Сборка Linux
   build-linux:
     needs: prepare-version
     runs-on: ubuntu-latest
@@ -77,7 +98,8 @@ jobs:
             libfreetype6-dev \
             ninja-build \
             cmake \
-            xvfb
+            xvfb \
+            pkg-config
 
       - name: Configure CMake
         run: |
@@ -85,14 +107,16 @@ jobs:
           cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DVERSION="${{ needs.prepare-version.outputs.new_tag }}"
 
       - name: Build project
-        run: cmake --build build
+        run: cmake --build build --config Release
 
       - name: Verify build
         run: |
           if [ -f "build/physics" ]; then
             echo "✅ Linux build successful"
+            file build/physics
           else
             echo "❌ Linux executable not found"
+            find build/ -type f -name "*" | head -20
             exit 1
           fi
 
@@ -100,6 +124,8 @@ jobs:
         run: |
           if [ -d "data" ]; then
             echo "✅ Data directory exists"
+            echo "Contents:"
+            ls -la data/
           else
             echo "❌ Data directory not found!"
             exit 1
@@ -107,16 +133,28 @@ jobs:
 
       - name: Quick test
         run: |
+          echo "Running quick test (3 seconds)..."
           timeout --preserve-status 3 xvfb-run -a ./build/physics data/smile.txt || true
           echo "Test completed"
 
       - name: Package Linux
         run: |
           VERSION="${{ needs.prepare-version.outputs.new_tag }}"
+          echo "Packaging Linux version: $VERSION"
+          
           mkdir -p physics-linux-$VERSION
           cp build/physics physics-linux-$VERSION/
-          [ -d "data" ] && cp -r data/ physics-linux-$VERSION/
+          
+          if [ -d "data" ]; then
+            cp -r data/ physics-linux-$VERSION/
+          fi
+          
+          if [ -f "README.md" ]; then
+            cp README.md physics-linux-$VERSION/
+          fi
+          
           tar -czf physics-linux-$VERSION.tar.gz physics-linux-$VERSION/
+          echo "✅ Created: physics-linux-$VERSION.tar.gz"
 
       - name: Upload Linux artifact
         uses: actions/upload-artifact@v4
@@ -125,7 +163,7 @@ jobs:
           path: physics-linux-*.tar.gz
           retention-days: 7
 
-   # 3. Сборка Windows
+  # 3. Сборка Windows
   build-windows:
     needs: prepare-version
     runs-on: windows-latest
@@ -142,11 +180,14 @@ jobs:
         shell: pwsh
         run: |
           # Скачиваем SFML для Windows
+          Write-Output "Downloading SFML for Windows..."
           $SFML_URL = "https://github.com/SFML/SFML/releases/download/2.6.0/SFML-2.6.0-windows-vc17-64-bit.zip"
           Invoke-WebRequest -Uri $SFML_URL -OutFile "sfml.zip"
           Expand-Archive -Path "sfml.zip" -DestinationPath "C:/SFML"
+          
           # Устанавливаем переменную окружения для CMake
           Write-Output "SFML_DIR=C:/SFML/lib/cmake/SFML" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Output "✅ SFML installed to C:/SFML"
 
       - name: Configure CMake
         shell: pwsh
@@ -162,26 +203,26 @@ jobs:
       - name: Find executable
         shell: pwsh
         run: |
-          # Ищем исполняемый файл в папке build
+          Write-Output "Searching for executable in build directory..."
           $exe = Get-ChildItem -Path "build" -Recurse -Include "*.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
           
           if ($exe) {
-            # Сохраняем путь к исполняемому файлу
             $exePath = $exe.FullName
             Write-Output "EXE_PATH=$exePath" | Out-File -FilePath $env:GITHUB_ENV -Append
             Write-Output "✅ Found executable: $exePath"
           } else {
             Write-Output "❌ No executable found!"
-            # Показываем, что есть в папке build
-            Get-ChildItem -Path "build" -Recurse -File | Format-Table Name, FullName
+            Write-Output "Contents of build directory:"
+            Get-ChildItem -Path "build" -Recurse -File | Select-Object Name, FullName | Format-Table
             exit 1
           }
 
-      - name: Verify data
+      - name: Verify data files
         shell: pwsh
         run: |
           if (Test-Path "data") {
             Write-Output "✅ Data directory found"
+            Write-Output "Contents:"
             Get-ChildItem -Path "data"
           } else {
             Write-Output "❌ Data directory not found!"
@@ -191,20 +232,20 @@ jobs:
       - name: Quick test
         shell: pwsh
         run: |
-          if (![string]::IsNullOrEmpty($env:EXE_PATH) -and (Test-Path $env:EXE_PATH)) {
-            Write-Output "Testing $env:EXE_PATH with data\smile.txt..."
+          if (-not [string]::IsNullOrEmpty($env:EXE_PATH) -and (Test-Path $env:EXE_PATH)) {
+            Write-Output "Testing executable with data\smile.txt..."
             
             # Запускаем процесс
-            $process = Start-Process -FilePath "$env:EXE_PATH" `
+            $process = Start-Process -FilePath $env:EXE_PATH `
               -ArgumentList "data\smile.txt" `
               -NoNewWindow `
               -PassThru
             
-            # Даем программе запуститься
+            # Даем программе запуститься на 2 секунды
             Start-Sleep -Seconds 2
             
             # Завершаем процесс если он еще работает
-            if (!$process.HasExited) {
+            if (-not $process.HasExited) {
               Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
             }
             
@@ -217,17 +258,17 @@ jobs:
         shell: pwsh
         run: |
           $VERSION = "${{ needs.prepare-version.outputs.new_tag }}"
-          $FOLDER = "physics-windows-$VERSION"
+          Write-Output "Packaging Windows version: $VERSION"
           
-          # Создаем папку для релиза
-          New-Item -ItemType Directory -Path $FOLDER -Force
+          $FOLDER = "physics-windows-$VERSION"
+          New-Item -ItemType Directory -Path $FOLDER -Force | Out-Null
           
           # Копируем исполняемый файл
-          if (![string]::IsNullOrEmpty($env:EXE_PATH) -and (Test-Path $env:EXE_PATH)) {
-            Copy-Item -Path "$env:EXE_PATH" -Destination "$FOLDER\" -Force
-            Write-Output "✅ Copied executable to $FOLDER"
+          if (-not [string]::IsNullOrEmpty($env:EXE_PATH) -and (Test-Path $env:EXE_PATH)) {
+            Copy-Item -Path $env:EXE_PATH -Destination "$FOLDER\" -Force
+            Write-Output "✅ Copied executable"
           } else {
-            Write-Output "❌ Executable not found at $env:EXE_PATH"
+            Write-Output "❌ Executable not found!"
             exit 1
           }
           
@@ -243,14 +284,20 @@ jobs:
             Write-Output "✅ Copied data directory"
           }
           
+          # Копируем документацию
+          $docs = @("README.md", "LICENSE.txt", "CHANGELOG.md")
+          foreach ($doc in $docs) {
+            if (Test-Path $doc) {
+              Copy-Item -Path $doc -Destination "$FOLDER\" -Force
+              Write-Output "✅ Copied $doc"
+            }
+          }
+          
           # Создаем ZIP архив
           $zipFile = "physics-windows-$VERSION.zip"
           Compress-Archive -Path "$FOLDER\*" -DestinationPath $zipFile -CompressionLevel Optimal
           
           Write-Output "✅ Created package: $zipFile"
-          
-          # Сохраняем имя архива для следующего шага
-          Write-Output "ZIP_FILE=$zipFile" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v4
@@ -259,6 +306,7 @@ jobs:
           path: physics-windows-*.zip
           retention-days: 7
 
+  # 4. Создание релиза (только для main/master после успешной сборки)
   create-release:
     if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
     needs: [prepare-version, build-linux, build-windows]
@@ -267,6 +315,21 @@ jobs:
       contents: write
     
     steps:
+      - name: Debug tag info
+        run: |
+          echo "Tag from prepare-version: '${{ needs.prepare-version.outputs.new_tag }}'"
+          echo "Is release: ${{ needs.prepare-version.outputs.is_release }}"
+          
+          # Проверяем тег
+          TAG="${{ needs.prepare-version.outputs.new_tag }}"
+          if [ -z "$TAG" ] || [ "$TAG" = "t" ]; then
+            echo "ERROR: Invalid tag '$TAG'"
+            TAG="v0.0.${{ github.run_number }}"
+          fi
+          
+          echo "Using tag: $TAG"
+          echo "TAG=$TAG" >> $GITHUB_ENV
+
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
@@ -274,27 +337,38 @@ jobs:
 
       - name: List downloaded files
         run: |
-          find ./artifacts -type f -name "*.tar.gz" -o -name "*.zip"
+          echo "Downloaded artifacts:"
+          find ./artifacts -type f -name "*.tar.gz" -o -name "*.zip" | while read file; do
+            echo "  - $(basename "$file")"
+          done
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v1
         with:
-          tag_name: ${{ needs.prepare-version.outputs.new_tag }}
-          name: Release ${{ needs.prepare-version.outputs.new_tag }}
+          tag_name: ${{ env.TAG }}
+          name: "Physics Simulator ${{ env.TAG }}"
           body: |
-            # Physics Simulator ${{ needs.prepare-version.outputs.new_tag }}
+            # Physics Simulator ${{ env.TAG }}
             
             **Build Information:**
             - Commit: [${{ github.sha }}](https://github.com/${{ github.repository }}/commit/${{ github.sha }})
             - Branch: ${{ github.ref_name }}
-            - Build date: $(date -u +'%Y-%m-%d %H:%M:%S UTC')
+            - Build: \#${{ github.run_number }}
+            - Date: $(date -u +'%Y-%m-%d %H:%M:%S UTC')
             
-            **What's new:**
+            **Changes:**
             ${{ github.event.head_commit.message }}
             
             **Downloads:**
-            - `physics-linux-*.tar.gz` - Linux 64-bit
-            - `physics-windows-*.zip` - Windows 64-bit (includes all DLLs)
+            - [physics-linux-${{ env.TAG }}.tar.gz](physics-linux-${{ env.TAG }}.tar.gz) - Linux 64-bit
+            - [physics-windows-${{ env.TAG }}.zip](physics-windows-${{ env.TAG }}.zip) - Windows 64-bit (includes all DLLs)
+            
+            **How to use:**
+            1. Extract the archive
+            2. Run `physics` (Linux) or `physics.exe` (Windows)
+            3. Drag and drop .txt files into the window
+            
+            > This is an automated build from the CI/CD pipeline.
           draft: false
           prerelease: false
           files: |
