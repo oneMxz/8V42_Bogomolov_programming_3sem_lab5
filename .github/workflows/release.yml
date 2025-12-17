@@ -163,7 +163,8 @@ jobs:
             echo "✅ Found executable: $($exe.FullName)"
           } else {
             echo "❌ No executable found!"
-            exit 1
+            exit 1}
+        
           fi
 
       - name: Verify data
